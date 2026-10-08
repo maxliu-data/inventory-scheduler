@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from flask import Flask
 
+from tests.test_inventory_scheduling import request
 from utils.scheduling_routes import scheduling_api
 
 
@@ -103,6 +104,32 @@ class InventoryRoutesTests(unittest.TestCase):
         self.assertEqual(schedule["S2"]["slot"], "PM")
         self.assertEqual(schedule["S2"]["worker_ids"], ["W1"])
         self.assertEqual(schedule["S1"]["date"], schedule["S2"]["date"])
+        metrics = response.json["metrics"]
+        self.assertFalse(metrics["distance_optimization_enabled"])
+        self.assertFalse(metrics["distance_optimal"])
+        self.assertIsNone(metrics["total_commute_distance_km"])
+        self.assertEqual(len(metrics["worker_routes"]), 2)
+        self.assertTrue(all(row["distance_km"] is None for row in metrics["worker_routes"]))
+        self.assertIn("distance_optimization_disabled: missing coordinates", response.json["warnings"])
+
+    def test_real_engine_exposes_commute_metrics(self):
+        payload = request(stores=("S", "T"), workers=("W",))
+        payload["store_calendar"][0]["allowed_pm"] = False
+        payload["store_calendar"][1]["allowed_am"] = False
+        payload["store_locations"][1]["map_x"] = 121.6
+        response = self.client.post("/inventory_schedule", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["status"], "complete")
+        metrics = response.json["metrics"]
+        self.assertTrue(metrics["distance_optimization_enabled"])
+        self.assertTrue(metrics["distance_optimal"])
+        self.assertEqual(metrics["same_team_transitions"], 1)
+        self.assertEqual(len(metrics["worker_routes"]), 1)
+        route = metrics["worker_routes"][0]
+        self.assertEqual((route["worker_id"], route["date"], route["am_store_id"], route["pm_store_id"]),
+                         ("W", "2026-10-01", "S", "T"))
+        self.assertGreater(route["distance_km"], 0)
+        self.assertEqual(route["distance_km"], metrics["total_commute_distance_km"])
 
     def test_real_engine_rejects_invalid_schema(self):
         for body in [b"null", b"[]", b"{}", b'{"month":"2026-13"}']:

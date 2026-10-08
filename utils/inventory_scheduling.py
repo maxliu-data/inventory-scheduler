@@ -1,4 +1,4 @@
-"""Bounded, deterministic inventory scheduling; no optimality guarantee."""
+"""Bounded, deterministic coverage-first scheduling with round-trip minimization."""
 
 import calendar
 import html
@@ -98,7 +98,8 @@ class InventorySchedulingAgent:
             for diagnostic in row.get("diagnostics", []):
                 lines.append("限制：" + str(diagnostic.get("store_id", "整組")) +
                              "，" + diagnostic["reason"])
-        lines.append("此為有限搜尋草案，不保證最佳解；缺少業務資料時須由上游確認到期及日曆。")
+        lines.append("優先安排最多門市，再最小化每位人員每日住家往返門市總距離；"
+                     "搜尋達上限或缺少座標時不保證最佳解。缺少業務資料時須由上游確認到期及日曆。")
         lines.extend("提醒：" + warning for warning in result["warnings"])
         text = "\n".join(lines).translate(str.maketrans({"[": "［", "]": "］", "(": "（", ")": "）"}))
         return html.escape(text, quote=True)
@@ -231,6 +232,12 @@ class _Planner:
         self.current = []
         self.best = []
         self.reached = False
+        self.optimize_distance = (all(self.store_coords[s] is not None for s in self.due) and
+                                  all(c is not None for c in self.worker_coords.values()))
+        if self.due and not self.optimize_distance:
+            self.warnings.add("distance_optimization_disabled: missing coordinates")
+        self.best_distance = 0.0
+        self.distance_cache = {}
 
     @staticmethod
     def index(rows, field):
@@ -523,9 +530,46 @@ class _Planner:
             raise _SearchLimit()
         self.nodes += 1
 
-    @staticmethod
-    def distance(a, b):
-        return haversine_km(*a, *b) if a is not None and b is not None else None
+    def distance(self, a, b):
+        if a is None or b is None:
+            return None
+        key = tuple(sorted((a, b)))
+        if key not in self.distance_cache:
+            self.distance_cache[key] = haversine_km(*a, *b)
+        return self.distance_cache[key]
+
+    def route_distance(self, worker, am, pm):
+        home = self.worker_coords[worker]
+        stops = [self.store_coords[s] for s in (am, pm) if s is not None]
+        points = [home, *stops, home]
+        legs = [self.distance(a, b) for a, b in zip(points, points[1:])]
+        return None if None in legs else math.fsum(legs)
+
+    def commute_metrics(self, schedule):
+        routes = {}
+        for row in schedule:
+            for w in row["worker_ids"]:
+                route = routes.setdefault((row["date"], w), {
+                    "worker_id": w, "date": row["date"],
+                    "am_store_id": None, "pm_store_id": None})
+                route[row["slot"].lower() + "_store_id"] = row["store_id"]
+        ordered = [routes[key] for key in sorted(routes, key=lambda key: (key[0], _key(key[1])))]
+        for route in ordered:
+            route["distance_km"] = self.route_distance(
+                route["worker_id"], route["am_store_id"], route["pm_store_id"])
+        distances = [route["distance_km"] for route in ordered]
+        return {"worker_routes": ordered,
+                "total_commute_distance_km": None if None in distances else math.fsum(distances)}
+
+    def added_commute(self, worker, store, prior):
+        home = self.worker_coords[worker]
+        destination = self.store_coords[store]
+        opposite = next((row["store_id"] for row in prior if worker in row["worker_ids"]), None)
+        if opposite is None:
+            return 2 * self.distance(home, destination)
+        other = self.store_coords[opposite]
+        return (self.distance(home, destination) + self.distance(destination, other) -
+                self.distance(home, other))
 
     def counterpart_rows(self, d, slot):
         return [r for r in self.current if r["date"] == d.isoformat() and r["slot"] != slot]
@@ -562,6 +606,7 @@ class _Planner:
             return
         prior = self.counterpart_rows(d, slot)
         prior.sort(key=lambda row: (self.transition_rank(s, row, eligible), _key(row["store_id"])))
+        commute = {w: self.added_commute(w, s, prior) for w in eligible} if self.optimize_distance else {}
         seen = set()
         # Try an actual intact half-day team before generating regrouped combinations.
         for row in prior:
@@ -578,8 +623,9 @@ class _Planner:
                          for v in required if v != w]
             known = [x for x in distances if x is not None]
             same_area = s in self.areas and self.workers[w].get("area_id") == self.areas[s]["area_id"]
-            return (not same_area, not self.leaders[w],
-                    sum(known) if known else float("inf"), _key(w))
+            legacy = (not same_area, not self.leaders[w],
+                      sum(known) if known else float("inf"), _key(w))
+            return (commute[w], *legacy) if self.optimize_distance else legacy
         eligible.sort(key=preference)
         pools = {}
         for w in eligible:
@@ -599,7 +645,8 @@ class _Planner:
             focus = min(prior, key=lambda row: (
                 self.transition_rank(s, row, pool), _key(row["store_id"])), default=None)
             previous = set(focus["worker_ids"]) if focus else set()
-            pool.sort(key=lambda w: (w not in previous, preference(w)))
+            pool.sort(key=lambda w: ((commute[w], w not in previous, preference(w))
+                                    if self.optimize_distance else (w not in previous, preference(w))))
             optional = [w for w in pool if w not in required]
             anchors = sorted(required, key=_key)
             if not anchors and pool:
@@ -607,11 +654,13 @@ class _Planner:
                 anchor = pool[0]
                 def coworker_preference(w):
                     distance = self.distance(self.worker_coords[anchor], self.worker_coords[w])
-                    return (w != anchor, w not in previous,
-                            distance if distance is not None else float("inf"), preference(w))
+                    legacy = (w != anchor, w not in previous,
+                              distance if distance is not None else float("inf"), preference(w))
+                    return (commute[w], *legacy) if self.optimize_distance else legacy
                 optional.sort(key=coworker_preference)
             elif previous:
-                optional.sort(key=lambda w: (w not in previous, preference(w)))
+                optional.sort(key=lambda w: ((commute[w], w not in previous, preference(w))
+                                            if self.optimize_distance else (w not in previous, preference(w))))
             for extra in itertools.combinations(optional, self.needs[s] - len(anchors)):
                 self.tick()
                 team = tuple(sorted(anchors + list(extra), key=_key))
@@ -687,11 +736,19 @@ class _Planner:
 
     def search(self, remaining):
         self.tick()
-        if len(self.current) > len(self.best):
+        distance = (self.commute_metrics(self.current)["total_commute_distance_km"]
+                    if self.optimize_distance and len(self.current) >= len(self.best) else None)
+        if (len(self.current) > len(self.best) or
+                self.optimize_distance and len(self.current) == len(self.best) and
+                distance < self.best_distance):
             self.best = list(self.current)
-        if len(self.best) == len(self.due) or not remaining:
-            return len(self.best) == len(self.due)
-        if len(self.current) + sum(map(len, remaining)) <= len(self.best):
+            self.best_distance = distance
+        if len(self.best) == len(self.due) and (not self.optimize_distance or self.best_distance == 0):
+            return True
+        if not remaining:
+            return False
+        possible = len(self.current) + sum(map(len, remaining))
+        if possible < len(self.best) or (possible == len(self.best) and not self.optimize_distance):
             return False
         unit = min(remaining, key=self.unit_preference)
         tail = [ss for ss in remaining if ss is not unit]
@@ -821,15 +878,25 @@ class _Planner:
                 "schedule": sorted(self.best, key=lambda r: (r["date"], r["slot"], _key(r["store_id"]))),
                 "unscheduled": unscheduled, "skipped": self.skipped,
                 "warnings": sorted(self.warnings),
-                "notes": ["Bounded deterministic heuristic; no optimality guarantee.",
+                "notes": ["Maximize scheduled stores first, then minimize total worker-day "
+                          "home -> AM -> PM -> home great-circle distance. A single half-day "
+                          "or ultra-remote AM visit is home -> store -> home.",
+                          "Distance optimization requires coordinates for all due stores and all workers; "
+                          "otherwise legacy preferences apply. Unknown route distances are null.",
+                          "Distance optimality is certified only when enabled and search finishes "
+                          "without its limit, including a complete zero-distance lower bound. "
+                          "Equal objective values retain deterministic preferences.",
                           "Without cycle/event metadata, upstream must supply due stores and "
                           "calendars encoding business constraints. Missing slots are unavailable.",
                           "Historical inventory intervals are checked only when last_inventory_date "
                           "is supplied; missing history is not inferred.",
                           "Organizational support checks require organizational_support=true.",
                           "Sunday is prohibited. Saturday requires explicit store and worker availability.",
-                          "Distances are great-circle preferences, not travel-time feasibility.",
+                          "Distances are great-circle distances, not travel-time feasibility.",
                           "Driving, vehicle rotation, fuel reimbursement and inventory-based "
                           "headcount calculations are not modeled."],
                 "metrics": {"search_nodes": self.nodes, "search_limit": self.limit,
-                            "reached_search_limit": self.reached, **transitions}}
+                            "reached_search_limit": self.reached, **transitions,
+                            "distance_optimization_enabled": self.optimize_distance,
+                            "distance_optimal": self.optimize_distance and not self.reached,
+                            **self.commute_metrics(self.best)}}
