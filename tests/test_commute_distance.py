@@ -179,18 +179,24 @@ class CommuteDistanceTests(unittest.TestCase):
                                     options.append({"store_id": store, "date": row["date"], "slot": slot,
                                                     "worker_ids": [worker["worker_id"]]})
                     choices.append(options)
-                oracle = (0, 0)
+                oracle = (0, 0, 0)
                 for candidate in itertools.product(*choices):
                     schedule = [r for r in candidate if r is not None]
                     reservations = [(r["worker_ids"][0], r["date"], r["slot"]) for r in schedule]
                     if len(set(reservations)) != len(reservations):
                         continue
-                    objective = (-len(schedule), math.fsum(independent_routes(payload, schedule).values()))
+                    intact = sum(am["date"] == pm["date"] and
+                                 set(am["worker_ids"]) == set(pm["worker_ids"])
+                                 for am in schedule if am["slot"] == "AM"
+                                 for pm in schedule if pm["slot"] == "PM")
+                    objective = (-len(schedule), -intact,
+                                 math.fsum(independent_routes(payload, schedule).values()))
                     oracle = min(oracle, objective)
                 result = self.generate(payload)
                 self.assertTrue(result["metrics"]["distance_optimal"])
                 self.assertEqual(-len(result["schedule"]), oracle[0])
-                self.assertAlmostEqual(result["metrics"]["total_commute_distance_km"], oracle[1])
+                self.assertEqual(-result["metrics"]["same_team_transitions"], oracle[1])
+                self.assertAlmostEqual(result["metrics"]["total_commute_distance_km"], oracle[2])
                 self.assert_routes(payload, result)
 
     def test_coverage_beats_zero_distance_partial_schedule(self):

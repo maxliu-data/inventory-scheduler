@@ -512,7 +512,7 @@ class InventorySchedulingTests(unittest.TestCase):
         p["workers"][1]["map_x"] = 0
         self.assertEqual(self.generate(p)["schedule"][0]["worker_ids"], ["A", "C"])
 
-    def test_ten_kilometer_preference_changes_actual_slot_choice(self):
+    def test_intact_team_objective_outweighs_ten_kilometer_slot_preference(self):
         p = request(stores=("S", "T"))
         p["workers"][1]["is_leader"] = True
         p["store_rules"] = [{"store_id": "S", "required_worker_ids": ["A"]}]
@@ -522,7 +522,10 @@ class InventorySchedulingTests(unittest.TestCase):
         p["store_locations"][1]["map_x"] = 0
         far = self.generate(p)
         self.assertEqual({r["store_id"]: r["slot"] for r in far["schedule"]},
-                         {"S": "AM", "T": "AM"})
+                         {"S": "AM", "T": "PM"})
+        self.assertEqual(far["metrics"]["same_team_transitions"], 1)
+        self.assertEqual(far["metrics"]["long_distance_transitions"], 1)
+        self.assertTrue(any(w.startswith("transition_over_10km:") for w in far["warnings"]))
 
     def test_same_team_preference_keeps_both_members_across_half_days(self):
         p = request(stores=("S", "T"), workers=("A", "B", "C"), headcount=2)

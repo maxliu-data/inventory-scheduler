@@ -105,6 +105,8 @@ class InventoryRoutesTests(unittest.TestCase):
         self.assertEqual(schedule["S2"]["worker_ids"], ["W1"])
         self.assertEqual(schedule["S1"]["date"], schedule["S2"]["date"])
         metrics = response.json["metrics"]
+        self.assertTrue(metrics["team_continuity_optimal"])
+        self.assertEqual(metrics["same_team_transitions"], 0)
         self.assertFalse(metrics["distance_optimization_enabled"])
         self.assertFalse(metrics["distance_optimal"])
         self.assertIsNone(metrics["total_commute_distance_km"])
@@ -121,6 +123,7 @@ class InventoryRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["status"], "complete")
         metrics = response.json["metrics"]
+        self.assertTrue(metrics["team_continuity_optimal"])
         self.assertTrue(metrics["distance_optimization_enabled"])
         self.assertTrue(metrics["distance_optimal"])
         self.assertEqual(metrics["same_team_transitions"], 1)
@@ -139,6 +142,17 @@ class InventoryRoutesTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(response.json["status"], "error")
+
+    def test_real_engine_exposes_uncertified_continuity_when_search_is_limited(self):
+        payload = request()
+        payload["search_limit"] = 1
+        response = self.client.post("/inventory_schedule", json=payload)
+        self.assertEqual(response.status_code, 200)
+        metrics = response.json["metrics"]
+        self.assertEqual(metrics["same_team_transitions"], 0)
+        self.assertTrue(metrics["reached_search_limit"])
+        self.assertFalse(metrics["team_continuity_optimal"])
+        self.assertFalse(metrics["distance_optimal"])
 
 
 if __name__ == "__main__":

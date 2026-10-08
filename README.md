@@ -61,8 +61,9 @@ branch `copilot/generate-monthly-schedule-agent`, commit
 `87934a260e90e5788e1e6ba50f0e96c24a9618c1`.
 The inventory engine, its Python import path, the `POST /inventory_schedule`
 contract, inventory tests, and inventory documentation were migrated.
-The standalone engine now also minimizes employee round-trip distances as
-described below; this optimization is an enhancement to the original scheduler.
+The standalone engine now also optimizes intact AM-to-PM team continuity and
+employee round-trip distances as described below; these are enhancements to the
+original scheduler.
 The original MIT license is included in `LICENSE`. The source repository is
 unchanged. The unrelated generic monthly employee scheduler (`/monthly_schedule`),
 chatbot tools/UI, Socket.IO, and cloud integrations are intentionally not migrated.
@@ -196,20 +197,31 @@ FC `cycle_months` 須為六個交替月份，例如 `[1, 3, 5, 7, 9, 11]`；
 - 閉店、轉店、解約、續約店優先且限 AM；效期檢查同日禁排。
 - 改裝前 3 個工作日或改裝後 3 個工作日內安排；工作日按週一至週六、
   扣除 `holidays` 計算，與個別員工休假分開。
-- 上下午可換組；同組、店間 **10 公里內**及人員間距離仍為搜尋順序的軟性偏好，
-  但排入店數相同時，以全體員工往返總距離較短的班表為優先。
-  這些偏好不能犧牲共同群組或核定人數。
+- 上下午可換組，但排入店數相同時，優先讓上午同店的完整團隊於下午一起到另一店；
+  保持完整團隊的次數也相同時，再以全體員工往返總距離較短的班表為優先。
+  店間 **10 公里內**及人員間距離仍影響搜尋順序。
+  這些偏好不能犧牲共同群組、核定人數或其他硬性規則。
 - 大複數店及特殊店優先；區域匹配、月中地區店與後續外地行程作為排序偏好。
 - 一部可跨課支援、二部不能跨課；跨部支援不自動開放，共同員工群組限制仍適用。
 - **暫不處理出車、駕駛輪替、油料補助及星期五遠途出車規則**；不納入超市或庫存重算。
 
-### 員工往返距離最小化
+### 上下午完整團隊延續與往返距離最小化
 
 目標依序為：
 
-1. 在所有硬性規則下，盡量排入更多應盤店舖；不會為了降低距離而少排店。
-2. 排入店數相同時，最小化**全月、全體員工每日往返距離的總和**。
+1. 在所有硬性規則下，盡量排入更多應盤店舖；不會為了保持團隊或降低距離而少排店。
+2. 排入店數相同時，最大化**同一天上午、下午在不同店鋪保持完整團隊的次數**。
+3. 排入店數與完整團隊延續次數皆相同時，最小化**全月、全體員工每日往返距離的總和**。
    不是只找最近的上午／下午店，也不是分別保證每位員工的個人路線最短。
+
+「完整團隊」表示 AM 與 PM 的 `worker_ids` 集合完全相同，不只是具有相同
+`group_id`。例如上午甲、乙兩人在 A 店，下午仍由甲、乙兩人在 B 店，算一次；
+下午改成甲、丙，或增加丙為三人，都不算完整延續。單人班組也適用。
+此目標按完整延續的店鋪配對次數計算，不按人數加權。
+
+這是**可讓步的偏好，不是強制同組**：下午人數不同、有人休假、缺少 Leader、
+指定人員或共同群組不符時，仍可拆組或換人，不會強行超額安排。
+保持完整團隊可能比拆組多走一些路；依上述優先序，仍會選擇完整團隊較多的班表。
 
 員工主檔的 `map_x`／`map_y` 視為住址座標。每天按實際分派計算：
 
@@ -220,13 +232,15 @@ FC `cycle_months` 須為六個交替月份，例如 `[1, 3, 5, 7, 9, 11]`；
 
 三段距離都採 Haversine 球面距離，不是道路里程或交通時間。
 必須提供**所有本月應盤店及所有輸入員工**的完整座標才會啟用距離最佳化。
-任一缺漏時，保留原有排班搜尋，並回傳
+任一缺漏時，仍最佳化排入店數及完整團隊延續，但不比較往返距離，並回傳
 `distance_optimization_disabled: missing coordinates` 提醒，不把未知距離當成零。
 即使缺座標的員工最終未被安排，仍採此保守退回規則。
 
 找到第一份完整班表後，搜尋仍會在 `search_limit` 範圍內比較其他班表；
-同店數、同距離時保留先找到的結果。達搜尋上限就回傳目前找到的最佳班表，
-**不保證全域最短**。完整且總距離為零時可提早停止，因已達距離下界。
+三個目標皆相同時保留先找到的結果。達搜尋上限就回傳目前找到的最佳班表，
+**不保證團隊延續最多或距離最短**。只有已排滿且完整團隊延續達可證明的上界，
+同時總距離為零（或距離最佳化未啟用）時，才可提前結束搜尋。
+單純排滿且零距離，不足以判定團隊延續已最佳。
 
 ### 回應與限制
 
@@ -235,19 +249,22 @@ HTTP 200 回傳 `status`（`complete`／`partial`）、`schedule`（店舖、日
 `skipped`（非本月應盤店）、`warnings`、`notes` 及 `metrics`。
 `metrics` 包含搜尋統計及實際 AM／PM 銜接的 `transitions`；
 同組保持、拆組、距離超過 10 公里或無法計算距離會另行統計／提示。
-另提供以下往返距離欄位：
+另提供以下團隊延續與往返距離欄位：
 
 | `metrics` 欄位 | 說明 |
 | --- | --- |
+| `same_team_transitions` | AM 與 PM 在不同店鋪且人員集合完全相同的配對次數，即第二順位最佳化目標 |
+| `team_continuity_optimal` | 是否已確認在最多可排店數下，完整團隊延續次數最多；搜尋達上限時為 `false` |
 | `distance_optimization_enabled` | 是否具備完整座標並啟用往返距離最佳化 |
 | `total_commute_distance_km` | 班表中所有員工每日往返距離總和；任一實際路線距離未知則為 `null`，空班表為 `0` |
 | `worker_routes` | 每位已安排員工每天的 `worker_id`、`date`、`am_store_id`、`pm_store_id`、`distance_km`；無該半天班別時店號為 `null`，距離未知亦為 `null` |
-| `distance_optimal` | 是否已確認在最多可排店數下的距離最小解；座標不足或搜尋達上限時為 `false` |
+| `distance_optimal` | 是否已確認在最多可排店數、最多完整團隊延續次數下的距離最小解；座標不足或搜尋達上限時為 `false` |
 
 `status: "complete"` 僅表示應盤店均已排入，**不代表距離已最佳化完成**；
-請同時檢查 `distance_optimal` 與 `reached_search_limit`。
-未達搜尋上限而完成搜尋（或完整班表已達零距離下界）且已啟用距離最佳化時，
-`distance_optimal` 才為 `true`；此判斷只針對模型中的球面距離及限制。
+請同時檢查 `team_continuity_optimal`、`distance_optimal` 與 `reached_search_limit`。
+未達搜尋上限而完成搜尋（包含達到上述全部目標界限的提早結束）且已啟用
+距離最佳化時，`distance_optimal` 才為 `true`；此判斷只針對模型中的
+優先序、球面距離及限制，不表示忽略團隊延續後仍為最短距離。
 
 `unscheduled[].diagnostics` 補充可直接確認的原因，例如無可用時段、
 複數店無共同日期、人數不足、無 Leader、無共同員工群組或指定人員不可用；

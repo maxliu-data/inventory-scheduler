@@ -1,4 +1,4 @@
-"""Bounded, deterministic coverage-first scheduling with round-trip minimization."""
+"""Bounded scheduling: maximize coverage, keep teams intact, minimize round trips."""
 
 import calendar
 import html
@@ -98,8 +98,10 @@ class InventorySchedulingAgent:
             for diagnostic in row.get("diagnostics", []):
                 lines.append("限制：" + str(diagnostic.get("store_id", "整組")) +
                              "，" + diagnostic["reason"])
-        lines.append("優先安排最多門市，再最小化每位人員每日住家往返門市總距離；"
-                     "搜尋達上限或缺少座標時不保證最佳解。缺少業務資料時須由上游確認到期及日曆。")
+        lines.append("優先安排最多門市，再最大化同日上下午完整同隊轉店次數，最後最小化"
+                     "每位人員每日住家往返門市總距離；同隊偏好不阻擋可行排程。"
+                     "搜尋達上限時不保證最佳解；缺少座標僅停用距離最佳化，仍優先維持完整同隊。"
+                     "缺少業務資料時須由上游確認到期及日曆。")
         lines.extend("提醒：" + warning for warning in result["warnings"])
         text = "\n".join(lines).translate(str.maketrans({"[": "［", "]": "］", "(": "（", ")": "）"}))
         return html.escape(text, quote=True)
@@ -237,6 +239,8 @@ class _Planner:
         if self.due and not self.optimize_distance:
             self.warnings.add("distance_optimization_disabled: missing coordinates")
         self.best_distance = 0.0
+        self.best_continuity = 0
+        self.continuity_bound = len(self.due) // 2
         self.distance_cache = {}
 
     @staticmethod
@@ -734,21 +738,35 @@ class _Planner:
                 min(self.transition_preference(s) for s in stores),
                 sum(len(self.available[s]) for s in stores), tuple(_key(s) for s in stores))
 
+    @staticmethod
+    def continuity_score(schedule):
+        """Count exact same-date AM/PM teams, without emitting candidate warnings."""
+        morning = {(r["date"], frozenset(r["worker_ids"])): r["store_id"]
+                   for r in schedule if r["slot"] == "AM"}
+        return sum((r["date"], frozenset(r["worker_ids"])) in morning and
+                   morning[r["date"], frozenset(r["worker_ids"])] != r["store_id"]
+                   for r in schedule if r["slot"] == "PM")
+
     def search(self, remaining):
         self.tick()
-        distance = (self.commute_metrics(self.current)["total_commute_distance_km"]
-                    if self.optimize_distance and len(self.current) >= len(self.best) else None)
-        if (len(self.current) > len(self.best) or
-                self.optimize_distance and len(self.current) == len(self.best) and
-                distance < self.best_distance):
-            self.best = list(self.current)
-            self.best_distance = distance
-        if len(self.best) == len(self.due) and (not self.optimize_distance or self.best_distance == 0):
+        if len(self.current) >= len(self.best):
+            continuity = self.continuity_score(self.current)
+            distance = (self.commute_metrics(self.current)["total_commute_distance_km"]
+                        if self.optimize_distance else 0.0)
+            objective = (len(self.current), continuity, -distance)
+            incumbent = (len(self.best), self.best_continuity, -self.best_distance)
+            if objective > incumbent:
+                self.best = list(self.current)
+                self.best_continuity = continuity
+                self.best_distance = distance
+        # Each store participates in at most one intact pair, so this proves all objectives.
+        if (len(self.best) == len(self.due) and self.best_continuity == self.continuity_bound and
+                (not self.optimize_distance or self.best_distance == 0)):
             return True
         if not remaining:
             return False
         possible = len(self.current) + sum(map(len, remaining))
-        if possible < len(self.best) or (possible == len(self.best) and not self.optimize_distance):
+        if possible < len(self.best):
             return False
         unit = min(remaining, key=self.unit_preference)
         tail = [ss for ss in remaining if ss is not unit]
@@ -878,13 +896,21 @@ class _Planner:
                 "schedule": sorted(self.best, key=lambda r: (r["date"], r["slot"], _key(r["store_id"]))),
                 "unscheduled": unscheduled, "skipped": self.skipped,
                 "warnings": sorted(self.warnings),
-                "notes": ["Maximize scheduled stores first, then minimize total worker-day "
+                "notes": ["Maximize scheduled stores first, then maximize same-date AM/PM pairs "
+                          "at different stores with exactly identical worker ID sets "
+                          "(same_team_transitions), then minimize total worker-day "
                           "home -> AM -> PM -> home great-circle distance. A single half-day "
                           "or ultra-remote AM visit is home -> store -> home.",
+                          "Team continuity is a soft objective, never a feasibility constraint; "
+                          "adding or removing workers does not count as an intact team.",
                           "Distance optimization requires coordinates for all due stores and all workers; "
-                          "otherwise legacy preferences apply. Unknown route distances are null.",
-                          "Distance optimality is certified only when enabled and search finishes "
-                          "without its limit, including a complete zero-distance lower bound. "
+                          "otherwise coverage and team continuity are still optimized. "
+                          "Unknown route distances are null.",
+                          "Team continuity optimality is certified when search finishes without its limit. "
+                          "Distance optimality is conditional on maximum coverage and continuity, "
+                          "and is certified only when enabled and search finishes without its limit. "
+                          "A full schedule reaching floor(due stores / 2) intact pairs and zero distance "
+                          "(or disabled distance optimization) also proves optimality. "
                           "Equal objective values retain deterministic preferences.",
                           "Without cycle/event metadata, upstream must supply due stores and "
                           "calendars encoding business constraints. Missing slots are unavailable.",
@@ -897,6 +923,7 @@ class _Planner:
                           "headcount calculations are not modeled."],
                 "metrics": {"search_nodes": self.nodes, "search_limit": self.limit,
                             "reached_search_limit": self.reached, **transitions,
+                            "team_continuity_optimal": not self.reached,
                             "distance_optimization_enabled": self.optimize_distance,
                             "distance_optimal": self.optimize_distance and not self.reached,
                             **self.commute_metrics(self.best)}}
